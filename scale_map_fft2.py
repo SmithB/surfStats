@@ -146,7 +146,7 @@ def main():
     args=parser.parse_args()
     
     thefile=args.input_file
-    N_LW=np.int(args.N_LW)
+    N_LW=int(args.N_LW)
     
     if args.num_processes>1:
         # setup the multiprocessing pool
@@ -184,7 +184,7 @@ def main():
     driver=gdal.GetDriverByName("GTiff")
     xform=np.array(ds.GetGeoTransform())
 
-    scales=2.**np.arange(1, 1.+np.int(np.log2(N_LW)));
+    scales=2.**np.arange(1, 1.+int(np.log2(N_LW)));
     print("running scales:")
     print(scales)
 
@@ -203,7 +203,7 @@ def main():
     band=ds.GetRasterBand(1)
     #N.B. changed N/2 to N/4
     dec=N/4;
-    blocksize=4096
+    blocksize=np.minimum(4096, 8*N)
     inNoData=band.GetNoDataValue()
     if inNoData is None:
         inNoData = 0
@@ -213,14 +213,14 @@ def main():
     nX=band.XSize;
     nY=band.YSize;
     P_Ds = driver.Create(P_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    P_sub=im_subset(0, 0, np.int( nX/dec), np.int(nY/dec), P_Ds, Bands=bands)
+    P_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), P_Ds, Bands=bands)
     az_Ds = driver.Create(az_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    az_sub=im_subset(0, 0, np.int( nX/dec), np.int(nY/dec), az_Ds, Bands=bands)
+    az_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), az_Ds, Bands=bands)
     R_Ds = driver.Create(R_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    R_sub=im_subset(0, 0, np.int( nX/dec), np.int(nY/dec), R_Ds, Bands=bands)
+    R_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), R_Ds, Bands=bands)
 
     Ps_Ds = driver.Create(Ps_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    Ps_sub=im_subset(0, 0, np.int( nX/dec), np.int(nY/dec), Ps_Ds, Bands=bands)
+    Ps_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), Ps_Ds, Bands=bands)
 
     total_fft_time=0.0
     start_time=time.time()
@@ -236,17 +236,17 @@ def main():
     dtime=0
     stride=blocksize-2*N
     print("nX_out=%f, nY_out=%f" % (int(nX/dec), int(nY/dec)))
-    N_out_sub=np.int(blocksize/dec)-1
+    N_out_sub=int(blocksize/dec)-1
     for in_sub in im_subset(0, 0,  nX,  nY, ds, pad_val=0, Bands=[1], stride=blocksize-2*N, pad=N, no_edges=False):
-        P_sub.setBounds(np.int((in_sub.c0+N/2)/dec), np.int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        P_sub.z=np.zeros([N_bands, np.int( N_out_sub), np.int(N_out_sub)])+out_nodata;
-        az_sub.setBounds(np.int((in_sub.c0+N/2)/dec), np.int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        az_sub.z=np.zeros([N_bands, np.int( N_out_sub), np.int(N_out_sub)])+out_nodata;
-        R_sub.setBounds(np.int((in_sub.c0+N/2)/dec), np.int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        R_sub.z=np.zeros([N_bands, np.int( N_out_sub), np.int(N_out_sub)])+out_nodata;
+        P_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
+        P_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
+        az_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
+        az_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
+        R_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
+        R_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
 
-        Ps_sub.setBounds(np.int((in_sub.c0+N/2)/dec), np.int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        Ps_sub.z=np.zeros([N_bands, np.int( N_out_sub), np.int(N_out_sub)])+out_nodata;
+        Ps_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
+        Ps_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
 
         sys.stdout.write("\r\b r0=%d/%d, c0=%d/%d, last dt=%f" %(int(in_sub.r0/stride), int(float(in_sub.Nr)/float(stride)), int(float(nY)/float(stride)),int(nX/stride), dtime))
         sys.stdout.flush()
@@ -314,8 +314,8 @@ def main():
                 imageData[1,:,:]=np.float64(fft_sub_y.z[0,:,:])
             else:
                 imageData=np.float64(fft_sub.z[0,:,:])
-            r_out=np.int((fft_sub.r0+N/2)/dec)-P_sub.r0
-            c_out=np.int((fft_sub.c0+N/2)/dec)-P_sub.c0
+            r_out=int((fft_sub.r0+N/2)/dec)-P_sub.r0
+            c_out=int((fft_sub.c0+N/2)/dec)-P_sub.c0
             dd=np.float64(fft_sub.z[0,:,:])
             if np.sum(dd.ravel)==0:
                 continue
