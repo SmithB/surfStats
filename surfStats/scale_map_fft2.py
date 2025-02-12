@@ -17,10 +17,12 @@ from multiprocessing import Pool, freeze_support
 import argparse
 #import scipy.fftpack as sfft
 import scipy.ndimage as snd
-import scipy.interpolate as sint
+#import scipy.interpolate as sint
 import numpy as np
-import matplotlib.pyplot as plt
-from im_subset import im_subset
+#import matplotlib.pyplot as plt
+from surfStats import im_subset
+import surfStats.scaleMap as sm
+
 try:
    import pyfftw as fft
 except ImportError:
@@ -30,106 +32,23 @@ import sys, os
 import time
 np.seterr(invalid='ignore')
 
-def az_lambda(nx, ny, dx, fold=False):
-    eps=np.float(1e-10)
-    if fold is True:
-        kx, ky=np.meshgrid( 2*np.pi*np.r_[ eps, np.arange(1.,nx/2+1)]/nx/dx,
-                            2*np.pi*np.r_[ eps, np.arange(1,ny/2), np.arange(-ny/2,0.)]/ny/dx);
-    else:
-        kx, ky=np.meshgrid( 2*np.pi*np.r_[ eps, np.arange(1.,nx/2), np.arange(-nx/2,0.)]/nx/dx,
-                                    2*np.pi*np.r_[ eps, np.arange(1,ny/2), np.arange(-ny/2,0.)]/ny/dx);
-    L=2*np.pi/np.sqrt(kx**2+ky**2);
-    L[0,0]=2*nx*dx;
-
-    az= np.arctan2(ky, kx);
-    return az, L, kx, ky
-
-def hanning2(n): 
-    x=np.arange(-(n/2-0.5), (n/2-0.5)+1);
-    [x,y]=np.meshgrid(x,x);
-    r=np.sqrt(x**2+y**2);
-
-    w=0.5+0.5*np.cos(2*np.pi*r/(n+1));  
-    w[r>n/2]=0.; 
-    return w
-
 def get_P_wrapper(argList):
     [ img, W, lambda_els, kx, ky, use_fftw, Wsum, Wsum2, use_mean, r_out, c_out]=argList
-    P, az, R, bar, fft_time=get_P(img, W, lambda_els, kx, ky, use_fftw=use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=use_mean)
+    P, az, R, bar, fft_time=sm.get_power(img, W, lambda_els, kx, ky, use_fftw=use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=use_mean)
     return (r_out, c_out, P, az, R, bar, fft_time)
-    
-def get_P(img, W, lambda_els, kx, ky, use_fftw=False, Wsum=1, Wsum2=1, use_mean=False):
-    Norm=np.sum(W.ravel());
-    if Norm>0:
-        Norm=1./Norm
-    start=time.time()
-    if use_fftw:
-        if len(img.shape)<=2:        
-            fft_buffer=fft.empty_aligned(img.shape) 
-        if len(img.shape)==3:
-            fft_buffer=fft.empty_aligned(img.shape[1:])
-    if len(img.shape)<=2 or img.shape[0]==1:
-        # this is the image case or the x-gradient-only case
-        bar=np.sum((img*W).ravel())*Norm        
-        if use_fftw:
-            fft_buffer[:]=W*(img-np.mean(img.ravel()))
-            P_IMG=np.abs(fft.interfaces.numpy_fft.rfftn(fft_buffer))**2
-        else:
-            P_IMG=np.abs(fft.rfftn((img-np.mean(img.ravel()))*W))**2         
+
+def mask_pgc( this_bounds, mask, pgc_subs, dec):
+    for key, sub in pgc_subs.items():
+        sub.setBounds(*this_bounds, update=True)
+    mask *= np.squeeze((pgc_subs['bitmask'].z == 0) | (pgc_subs['bitmask'].z == 2))
+    if dec > 1:
+        # skip erosion if the mask is all valid
+        if not np.all(pgc_subs['matchtag'].z):
+            mask *= snd.binary_erosion(
+                snd.binary_erosion(np.squeeze(pgc_subs['matchtag'].z), np.ones((1, dec), dtype=bool), border_value=1),
+                np.ones((dec,1), dtype=bool), border_value=1)
     else:
-        # this is the isotropic case: img is a list that holds the x and y slopes
-        bar=np.sum((np.abs(img[0,:,:])+np.abs(img[1,:,:])).ravel()*W.ravel())*Norm
-        if use_fftw:
-            fft_buffer[:]=W*(img[0,:,:]-np.mean(img[0,:,:].ravel()))
-            P_IMG=0.5*np.abs(fft.interfaces.numpy_fft.rfftn(fft_buffer, overwrite_input=False, threads=1))**2
-            fft_buffer[:]=W*(img[1,:,:]-np.mean(img[1,:,:].ravel()))
-            P_IMG=P_IMG+0.5*np.abs(fft.interfaces.numpy_fft.rfftn(fft_buffer, overwrite_input=False, threads=1))**2
-        else:
-            P_IMG=0.5*(np.abs(fft.rfftn((img[0,:,:]-np.mean(img[0,:,:].ravel()))*W))**2.+np.abs(fft.rfftn((img[1,:,:]-np.mean(img[1,:,:].ravel()))*W))**2.)
-    fft_time=time.time()-start
-    P_IMG=P_IMG.ravel()
-    az=np.zeros([len(lambda_els),1])
-    P=np.zeros([len(lambda_els),1])
-    R=np.zeros([len(lambda_els),1])
-    for ii, these in enumerate( lambda_els):
-        if use_mean is True:
-            P[ii]=np.mean(P_IMG[these])
-        else:
-            P[ii]=np.sum(P_IMG[these])
-        if P[ii]==0:
-            P[ii]=np.NaN
-        CC=gen_cov(P_IMG[these], kx[these], ky[these], xbar=0., ybar=0., sumW=Wsum, sumW2=Wsum2)
-        if np.any(np.isnan(CC.ravel())):
-            # NaNs cause eig to crash
-            az[ii]=np.NaN
-            R[ii]=np.NaN
-            continue
-        e_vals,e_vecs=np.linalg.eig(CC)
-        maxev=np.argmax(e_vals)
-        minev=1-maxev
-        az[ii]=180./np.pi * np.arctan2(e_vecs[0, maxev], e_vecs[1, maxev])
-        if e_vals[minev]==0:
-            R[ii]=np.NaN
-        else:
-            R[ii]=np.sqrt(e_vals[maxev]/e_vals[minev])
-    return P, az, R, bar, fft_time
-
-def gen_cov(W, x, y, xbar=None, ybar=None, sumW=None, sumW2=None):
-    if sumW is None:
-        sumW=np.sum(W.ravel())
-    if sumW2 is None:
-        sumW2=np.sum(W.ravel()*W.ravel())
-    if xbar is None:
-        xbar=np.sum(W*x)/sumW
-        ybar=np.sum(W*y)/sumW
-    xw=W*(x-xbar)
-    yw=W*(y-ybar)
-    covxx=np.sum(xw*xw) 
-    covyy=np.sum(yw*yw) 
-    covxy=np.sum(xw*yw)
-    C=np.array([[covxx, covxy], [covxy, covyy]])/sumW2
-    return C
-
+        mask &= pgc_subs['matchtag'].z
 
 def main():
     fold=True
@@ -142,10 +61,15 @@ def main():
     parser.add_argument('--use_mean','-m', action='store_true');
     parser.add_argument('--prefilter_width','-p', type=float, default=None)
     parser.add_argument('--num_processes','-n', type=int, default=1)
+    parser.add_argument('--mask_file', type=str)
+    parser.add_argument('--pgc_masks', action='store_true', help='Use the PGC bitmask and matchtags to mask the input') 
+    parser.add_argument('--mask_values', type=float, nargs='+')
+    parser.add_argument('--out_label', type=str, help='add this string to the output file name')
+    parser.add_argument('--avg_file', type=str, help='file whose values will be averaged at the same resolution as the ouput')
+    parser.add_argument('--avg_name', type=str, default='aux', help='name for the quantity derived from the average file')
     parser.add_argument('--isotropic', '-i', action='store_true');
     args=parser.parse_args()
     
-    thefile=args.input_file
     N_LW=int(args.N_LW)
     
     if args.num_processes>1:
@@ -158,28 +82,38 @@ def main():
     except:
         use_fftw=False
     
-    ds=gdal.Open(thefile);
-    
-    out_base=os.path.splitext(thefile)[0];
+    out_keys=['P','Ps','az','R']
+
+    ds=gdal.Open(args.input_file)
+    if args.avg_file is not None:
+        avg_ds=gdal.Open(args.avg_file)
+        avg_sub=im_subset(0, 0, 0, 0, avg_ds, pad_val=0, Bands=[1])
+
+    if args.mask_file is not None:
+        mask_ds=gdal.Open(args.mask_file)
+        mask_sub=im_subset(0, 0, 0, 0, mask_ds, pad_val=0, Bands=[1])
+    out_base=os.path.splitext(args.input_file)[0];
     
     if args.use_mean is True:
         out_base=out_base+"_mean"
         
-    P_file=out_base+'_P_fft2.tif'
-    Ps_file=out_base+'_Ps_fft2.tif'
-    az_file=out_base+'_az_fft2.tif'
-    R_file=out_base+'_R_fft2.tif'
+    if args.out_label is not None:
+        out_base += args.out_label
+        
+    out_files={}
+    for key in out_keys:
+        out_files[key]=out_base+f'_{key}_fft2.tif'
+
     out_nodata=np.NaN
         
-    print("working on %s, outfile is %s" % (thefile, P_file) )
+    print("working on %s, outfile is %s" % (args.input_file, out_files['P']) )
     if args.use_mean is True:
         print("----------using the mean instead of the sum")
             
-    for file in (P_file, az_file, R_file):
+    for file in out_files.values():
         if os.path.exists(file): 
             print("outfile %s exists, deleting" % file)
             os.remove(file)
-  
 
     driver=gdal.GetDriverByName("GTiff")
     xform=np.array(ds.GetGeoTransform())
@@ -191,10 +125,9 @@ def main():
     print("NOTE:: using two times the largest scale for N")
     N=(scales[-1])*2.
 
- 
-    az, L, kx, ky=az_lambda(N, N, 1, fold=fold)
+    az, L, kx, ky=sm.az_lambda(N, N, 1, fold=fold)
     L_bins=[np.ravel_multi_index(np.nonzero((L>=this) & (L < 2*this)), L.shape) for this in scales]
-    W=hanning2(N)
+    W=sm.hanning2(N)
     Wsum=np.sum(W.ravel())
     Wsum2=np.sum(W.ravel()*W.ravel())
 
@@ -212,19 +145,34 @@ def main():
 
     nX=band.XSize;
     nY=band.YSize;
-    P_Ds = driver.Create(P_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    P_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), P_Ds, Bands=bands)
-    az_Ds = driver.Create(az_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    az_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), az_Ds, Bands=bands)
-    R_Ds = driver.Create(R_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    R_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), R_Ds, Bands=bands)
+    subs={}
+    Dsets={}
+    for key, file in out_files.items():
+        Dsets[key] = driver.Create(file, int(nX/dec), int(nY/dec), len(scales),\
+                                   gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
+        # Does this need stride=1?
+        subs[key]=im_subset(0, 0, int( nX/dec), int(nY/dec), Dsets[key], Bands=list(bands))
 
-    Ps_Ds = driver.Create(Ps_file, int(nX/dec), int(nY/dec), len(scales), gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
-    Ps_sub=im_subset(0, 0, int( nX/dec), int(nY/dec), Ps_Ds, Bands=bands)
+    if args.avg_file is not None:
+        out_files[args.avg_name]=out_base+f'_{args.avg_name}_fft2.tif'
+        if os.path.exists(out_files[args.avg_name]): 
+            os.remove(out_files[args.avg_name])
+        Dsets[args.avg_name] = driver.Create(out_files[args.avg_name], int(nX/dec), int(nY/dec), 1,\
+                                   gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
+        subs[args.avg_name]=im_subset(0, 0, int( nX/dec), int(nY/dec), Dsets[args.avg_name], Bands=[1])
+        out_keys += [args.avg_name]
+
+    
+    if args.pgc_masks:
+        pgc_subs={}
+        for key, pad_val in zip(['matchtag','bitmask'], [1, 0]):
+            sub_ds=gdal.Open(args.input_file.replace('_dem.tif','_'+key+'.tif'))
+            pgc_subs[key] = im_subset(0, 0, nX, nY, sub_ds, pad_val=pad_val, Bands=[1])
+
 
     total_fft_time=0.0
     start_time=time.time()
-    for out_ds in (P_Ds, az_Ds, R_Ds, Ps_Ds):
+    for out_ds in Dsets.values():
         for bandN in [bands[0]]:
             band=out_ds.GetRasterBand(int(bandN))
             band.SetNoDataValue(out_nodata)
@@ -238,26 +186,37 @@ def main():
     print("nX_out=%f, nY_out=%f" % (int(nX/dec), int(nY/dec)))
     N_out_sub=int(blocksize/dec)-1
     for in_sub in im_subset(0, 0,  nX,  nY, ds, pad_val=0, Bands=[1], stride=blocksize-2*N, pad=N, no_edges=False):
-        P_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        P_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
-        az_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        az_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
-        R_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        R_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
+        in_bounds = [in_sub.c0, in_sub.r0, in_sub.Nc, in_sub.Nr]
+        out_bounds = [int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub]
+        for sub in subs.values():
+            sub.setBounds(*out_bounds)
+            sub.z = np.zeros([len(sub.Bands), int( N_out_sub), int(N_out_sub)])+out_nodata
 
-        Ps_sub.setBounds(int((in_sub.c0+N/2)/dec), int((in_sub.r0+N/2)/dec), N_out_sub, N_out_sub)
-        Ps_sub.z=np.zeros([N_bands, int( N_out_sub), int(N_out_sub)])+out_nodata;
-
-        sys.stdout.write("\r\b r0=%d/%d, c0=%d/%d, last dt=%f" %(int(in_sub.r0/stride), int(float(in_sub.Nr)/float(stride)), int(float(nY)/float(stride)),int(nX/stride), dtime))
+        sys.stdout.write("\r\b c0=%d/%d, r0=%d/%d, last dt=%f  " % \
+                         (int(float(in_sub.c0)/float(stride)), \
+                          int(float(nX)/float(stride)), \
+                          int(float(in_sub.r0)/float(stride)), \
+                          int(float(nY)/float(stride)), dtime))
         sys.stdout.flush()
-    
+
+        if args.mask_file is not None:
+            mask_sub.setBounds(*in_bounds, update=True)
+            in_sub.z.ravel()[~np.in1d(mask_sub.z.ravel(), args.mask_values)]=inNoData
+        
+        if args.pgc_masks:
+            mask = np.ones_like(in_sub.z, dtype=bool)
+            mask_pgc(in_bounds, mask, pgc_subs, int(dec))
+            in_sub.z.ravel()[mask.ravel()==0] = inNoData
+
         if np.all(np.logical_or(in_sub.z == 0, np.logical_or(np.isnan(in_sub.z), in_sub.z==inNoData))):
-            P_sub.writeSubsetTo(bands, P_sub)
-            az_sub.writeSubsetTo(bands, az_sub)
-            R_sub.writeSubsetTo(bands, R_sub)
-            Ps_sub.writeSubsetTo(bands, Ps_sub)
+            for sub in subs.values():
+                sub.writeSubsetTo(None, sub)
             continue
-    
+
+        if args.avg_file is not None:
+            avg_sub.setBounds(in_sub.c0, in_sub.r0, nX, nY, update=True)
+            avg_sub_sub = im_subset(0, 0, blocksize, blocksize, avg_sub)
+
         if args.erode_scale is not None:
             mask=np.logical_or(in_sub.z == 0., np.logical_or(np.isnan(in_sub.z), in_sub.z==inNoData))
             if np.any(mask):
@@ -314,20 +273,25 @@ def main():
                 imageData[1,:,:]=np.float64(fft_sub_y.z[0,:,:])
             else:
                 imageData=np.float64(fft_sub.z[0,:,:])
-            r_out=int((fft_sub.r0+N/2)/dec)-P_sub.r0
-            c_out=int((fft_sub.c0+N/2)/dec)-P_sub.c0
+            r_out=int((fft_sub.r0+N/2)/dec)-subs['P'].r0
+            c_out=int((fft_sub.c0+N/2)/dec)-subs['P'].c0
             dd=np.float64(fft_sub.z[0,:,:])
             if np.sum(dd.ravel)==0:
                 continue
+
+            if args.avg_file is not None:
+                avg_sub_sub.setBounds(fft_sub.c0, fft_sub.r0, fft_sub.Nc, fft_sub.Nr, update=True)
+                subs[args.avg_name].z[0,r_out, c_out]=np.nanmean(avg_sub_sub.z)
+
             if args.num_processes==1:
-                 P_i, az_i, R_i, bar_i, fft_time_i=get_P(imageData, W, L_bins, kx.ravel(), ky.ravel(), use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=args.use_mean)
-                 P_sub.z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)
-                 az_sub.z[:,r_out, c_out]=az_i.ravel()
-                 R_sub.z[:, r_out, c_out]=np.log10(R_i.ravel())
+                 P_i, az_i, R_i, bar_i, fft_time_i=sm.get_power(imageData, W, L_bins, kx.ravel(), ky.ravel(), use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=args.use_mean)
+                 subs['P'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)
+                 subs['az'].z[:,r_out, c_out]=az_i.ravel()
+                 subs['R'].z[:, r_out, c_out]=np.log10(R_i.ravel())
                  if bar_i == 0:
-                     Ps_sub.z[:, r_out, c_out]=np.NaN;
+                     subs['Ps'].z[:, r_out, c_out]=np.NaN;
                  else:
-                    Ps_sub.z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
+                    subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
                  total_fft_time=total_fft_time+fft_time_i
             else:
                 #P_i, az_i, R_i, bar_i=get_P(W, imageData, L_bins, kx.ravel(), ky.ravel(), use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=args.use_mean)
@@ -338,20 +302,29 @@ def main():
             #parallelOutputList=[get_P_wrapper(thing) for thing in parallelInputList]
             for parallelItem in parallelOutputList:
                 r_out, c_out, P_i, az_i, R_i, bar_i, fft_time_i = parallelItem
-                P_sub.z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)
-                az_sub.z[:,r_out, c_out]=az_i.ravel()
-                R_sub.z[:, r_out, c_out]=np.log10(R_i.ravel())
+                subs['P'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)
+                subs['az'].z[:,r_out, c_out]=az_i.ravel()
+                subs['R'].z[:, r_out, c_out]=np.log10(R_i.ravel())
                 if bar_i == 0:
-                    Ps_sub.z[:, r_out, c_out]=np.NaN;
+                    subs['Ps'].z[:, r_out, c_out]=np.NaN+np.ones_like(P_i.ravel());
                 else:
-                    Ps_sub.z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
+                    try:
+                       subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
+                    except Exception as e:
+                       print((r_out, c_out))
+                       print(P_i.shape)
+                       print(bar_i.shape)
+                       print(subs['Ps'].xy0.shape)
+                       print(subs['Ps'].pad)
+                       print((hasattr(subs['Ps'], 'xy0'), hasattr(subs['P'],'xy0')))
+                       subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
+                       raise(e)
                 total_fft_time=total_fft_time+fft_time_i
-        az_sub.z[az_sub.z<0]+=180. 
-        az_sub.z[P_sub.z==out_nodata]=out_nodata;
-        P_sub.writeSubsetTo(bands, P_sub)
-        Ps_sub.writeSubsetTo(bands, Ps_sub)
-        az_sub.writeSubsetTo(bands, az_sub)
-        R_sub.writeSubsetTo(bands, R_sub)
+        subs['az'].z[subs['az'].z<0]+=180. 
+        subs['az'].z[subs['P'].z==out_nodata]=out_nodata
+        for key, sub in subs.items():
+            sub.writeSubsetTo(sub.Bands, sub)#, VERBOSE=key=='P')
+
         dtime=time.time()-start
         start=time.time()
 
@@ -363,20 +336,17 @@ def main():
     xform[5]=xform[5]*dec
     xform[1]=xform[1]*dec
 
-    P_Ds.SetGeoTransform(tuple(xform))
-    P_Ds.SetProjection(ds.GetProjection())
-    az_Ds.SetGeoTransform(tuple(xform))
-    az_Ds.SetProjection(ds.GetProjection())
-    R_Ds.SetGeoTransform(tuple(xform))
-    R_Ds.SetProjection(ds.GetProjection())
-    Ps_Ds.SetGeoTransform(tuple(xform))
-    Ps_Ds.SetProjection(ds.GetProjection())
-    del P_Ds
-    del az_Ds
-    del R_Ds
-    del Ps_Ds
+    for key, DS in Dsets.items():
+        print(key)
+        DS.SetGeoTransform(tuple(xform))
+        DS.SetProjection(ds.GetProjection())
 
-     
+    sub=None
+    del(Dsets)
+    del(subs)
+    import gc
+    gc.collect()
+        
 if __name__=="__main__":
     freeze_support()
     main()
