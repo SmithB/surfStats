@@ -104,7 +104,7 @@ def main():
     for key in out_keys:
         out_files[key]=out_base+f'_{key}_fft2.tif'
 
-    out_nodata=np.NaN
+    out_nodata=np.nan
         
     print("working on %s, outfile is %s" % (args.input_file, out_files['P']) )
     if args.use_mean is True:
@@ -243,15 +243,15 @@ def main():
             mask=np.float32(mask)
             [gxm, gym]=np.gradient(mask[0,:,:])      
             mask=np.logical_or(np.logical_or(mask, gxm!=0), gym!=0)       
-            in_sub.z[mask]=np.NaN;
+            in_sub.z[mask]=np.nan
             if args.isotropic:
                 gy_sub=im_subset(in_sub.c0, in_sub.r0, in_sub.Nc, in_sub.Nr, None,  pad_val=0, Bands=[1], stride=blocksize-2*N, pad=N, no_edges=False)
                 gy_sub.z=np.array(gy)/dx;
                 gy_sub.z.shape=in_sub.z.shape;
-                gy_sub.z[mask]=np.NaN;
+                gy_sub.z[mask]=np.nan
             
         if args.take_log:
-           in_sub.z[(in_sub.z==0) | (in_sub.z==inNoData)] = np.NaN
+           in_sub.z[(in_sub.z==0) | (in_sub.z==inNoData)] = np.nan
            in_sub.z=np.log10(in_sub.z)
            
         parallelInputList=list();
@@ -289,7 +289,7 @@ def main():
                  subs['az'].z[:,r_out, c_out]=az_i.ravel()
                  subs['R'].z[:, r_out, c_out]=np.log10(R_i.ravel())
                  if bar_i == 0:
-                     subs['Ps'].z[:, r_out, c_out]=np.NaN;
+                     subs['Ps'].z[:, r_out, c_out]=np.nan
                  else:
                     subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
                  total_fft_time=total_fft_time+fft_time_i
@@ -306,7 +306,7 @@ def main():
                 subs['az'].z[:,r_out, c_out]=az_i.ravel()
                 subs['R'].z[:, r_out, c_out]=np.log10(R_i.ravel())
                 if bar_i == 0:
-                    subs['Ps'].z[:, r_out, c_out]=np.NaN+np.ones_like(P_i.ravel());
+                    subs['Ps'].z[:, r_out, c_out]= np.nan + np.ones_like(P_i.ravel());
                 else:
                     try:
                        subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)

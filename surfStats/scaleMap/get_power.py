@@ -56,19 +56,19 @@ def get_power(img, W, lambda_els, kx, ky, use_fftw=False, Wsum=1, Wsum2=1, use_m
         else:
             P[ii]=np.sum(P_IMG[these])
         if P[ii]==0:
-            P[ii]=np.NaN
+            P[ii]=np.nan
         CC=gen_cov(P_IMG[these], kx[these], ky[these], xbar=0., ybar=0., sumW=Wsum, sumW2=Wsum2)
         if np.any(np.isnan(CC.ravel())):
             # NaNs cause eig to crash
-            az[ii]=np.NaN
-            R[ii]=np.NaN
+            az[ii]=np.nan
+            R[ii]=np.nan
             continue
         e_vals,e_vecs=np.linalg.eig(CC)
         maxev=np.argmax(e_vals)
         minev=1-maxev
         az[ii]=180./np.pi * np.arctan2(e_vecs[0, maxev], e_vecs[1, maxev])
         if e_vals[minev]==0:
-            R[ii]=np.NaN
+            R[ii]=np.nan
         else:
             R[ii]=np.sqrt(e_vals[maxev]/e_vals[minev])
     return P, az, R, bar, fft_time
