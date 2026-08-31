@@ -7,6 +7,18 @@ Created on Fri Apr 19 14:41:53 2013
 @author: ben
 """
 
+# OpenBLAS sizes a spin-waiting thread pool to the core count in *every* process
+# that loads numpy -- parent and each Pool worker alike.  On a many-core host
+# that burns cores for no wall-clock gain (measured: 224% CPU vs 98%, same wall
+# time), and it multiplies when several instances run at once.  This has to
+# happen before numpy is loaded, and only when this file is the entry point --
+# as an imported module it must not reconfigure the caller's BLAS.  setdefault
+# leaves an explicit setting from the environment alone.
+if __name__ == "__main__":
+    import os as _os
+    for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        _os.environ.setdefault(_var, "1")
+
 try:
    from osgeo import gdal, gdalconst
 except ImportError:
@@ -32,9 +44,22 @@ import sys, os
 import time
 np.seterr(invalid='ignore')
 
+# The window, wavelength bins and wavenumber grids are identical for every tile
+# in the whole run, but Pool.map pickles each task's arguments separately, so
+# passing them per task re-sent ~70% of a 437 KB payload 841 times per block.
+# A Pool initializer sends them to each worker once instead.
+_worker_ctx={}
+
+def init_worker(W, lambda_els, kx, ky, use_fftw, Wsum, Wsum2, use_mean):
+    _worker_ctx.update(W=W, lambda_els=lambda_els, kx=kx, ky=ky,
+                       use_fftw=use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=use_mean)
+
 def get_P_wrapper(argList):
-    [ img, W, lambda_els, kx, ky, use_fftw, Wsum, Wsum2, use_mean, r_out, c_out]=argList
-    P, az, R, bar, fft_time=sm.get_power(img, W, lambda_els, kx, ky, use_fftw=use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=use_mean)
+    img, r_out, c_out = argList
+    c=_worker_ctx
+    P, az, R, bar, fft_time=sm.get_power(img, c['W'], c['lambda_els'], c['kx'], c['ky'],
+                                         use_fftw=c['use_fftw'], Wsum=c['Wsum'],
+                                         Wsum2=c['Wsum2'], use_mean=c['use_mean'])
     return (r_out, c_out, P, az, R, bar, fft_time)
 
 def pgc_companion_path(input_file, suffix):
@@ -104,9 +129,9 @@ def main():
         except AttributeError:
             use_fftw=False
 
-    if args.num_processes>1:
-        # setup the multiprocessing pool
-        myPool=Pool(args.num_processes);
+    # NB: the pool is created further down, once W/L_bins/kx/ky exist, so that
+    # they can be handed to the workers as initargs.
+    myPool=None
     
     out_keys=['P','Ps','az','R']
 
@@ -156,6 +181,14 @@ def main():
     W=sm.hanning2(N)
     Wsum=np.sum(W.ravel())
     Wsum2=np.sum(W.ravel()*W.ravel())
+
+    if args.num_processes>1:
+        # setup the multiprocessing pool.  Created here, after the pyfftw cache
+        # is enabled and after the spectral setup exists, so the workers inherit
+        # the former and receive the latter once at startup.
+        myPool=Pool(args.num_processes, initializer=init_worker,
+                    initargs=(W, L_bins, kx.ravel(), ky.ravel(), use_fftw,
+                              Wsum, Wsum2, args.use_mean))
 
     N_bands=len(scales)
     bands=1+np.arange(N_bands)
@@ -332,7 +365,7 @@ def main():
                     subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
                  total_fft_time=total_fft_time+fft_time_i
             else:
-                parallelInputList.append( (imageData, W, L_bins, kx.ravel(), ky.ravel(), use_fftw, Wsum, Wsum2, args.use_mean, r_out, c_out))
+                parallelInputList.append( (imageData, r_out, c_out))
         if args.num_processes>1:
             # now run the jobs in parallel, get their output (in random order)
             parallelOutputList=myPool.map(get_P_wrapper, parallelInputList)

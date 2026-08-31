@@ -83,8 +83,11 @@ class im_subset:
             self.copySubsetFrom(pad_val=self.pad_val)
 
     def copySubsetFrom(self, pad_val=0):
+        # np.zeros(...)+pad_val allocated the buffer twice; np.full fills it in
+        # place.  result_type reproduces the dtype promotion the addition did.
         if hasattr(self.source, 'level'):  # copy data from another subset
-            self.z = np.zeros((self.source.z.shape[0], self.Nr, self.Nc), self.source.z.dtype) + pad_val
+            self.z = np.full((self.source.z.shape[0], self.Nr, self.Nc), pad_val,
+                             np.result_type(self.source.z.dtype, pad_val))
             (sr0, sr1, dr0, dr1, vr)=match_range(self.source.r0, self.source.Nr, self.r0, self.Nr)
             (sc0, sc1, dc0, dc1, vc)=match_range(self.source.c0, self.source.Nc, self.c0, self.Nc)
             if (vr & vc):
@@ -94,7 +97,7 @@ class im_subset:
             band=self.source.GetRasterBand(int(self.Bands[0]))
             src_NB=self.source.RasterCount
             dt=gdal_dtype(gdal.GetDataTypeName(band.DataType))
-            self.z=np.zeros((src_NB, self.Nr, self.Nc), dt)+pad_val
+            self.z=np.full((src_NB, self.Nr, self.Nc), pad_val, np.result_type(dt, pad_val))
             (sr0, sr1, dr0, dr1, vr)=match_range(0, band.YSize, self.r0, self.Nr)
             (sc0, sc1, dc0, dc1, vc)=match_range(0, band.XSize, self.c0, self.Nc)
             if (vr & vc):

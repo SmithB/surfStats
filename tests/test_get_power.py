@@ -3,7 +3,7 @@ import pytest
 
 from surfStats.scaleMap.get_power import get_power
 from surfStats.scaleMap.spec_utils import az_lambda, hanning2
-from surfStats.scale_map_fft2 import get_P_wrapper
+from surfStats.scale_map_fft2 import get_P_wrapper, init_worker
 
 try:
     import pyfftw  # noqa: F401
@@ -119,8 +119,10 @@ def test_get_P_wrapper_matches_get_power_and_passes_through_indices():
         img, W, L_bins, kx, ky, use_fftw=False, Wsum=Wsum, Wsum2=Wsum2, use_mean=False
     )
 
-    arg_list = [img, W, L_bins, kx, ky, False, Wsum, Wsum2, False, 3, 7]
-    r_out, c_out, P, az, R, bar, fft_time = get_P_wrapper(arg_list)
+    # the spectral setup reaches a worker through the Pool initializer, so each
+    # task carries only the tile and its output indices
+    init_worker(W, L_bins, kx, ky, False, Wsum, Wsum2, False)
+    r_out, c_out, P, az, R, bar, fft_time = get_P_wrapper([img, 3, 7])
 
     assert (r_out, c_out) == (3, 7)
     assert np.allclose(P, direct_P)
