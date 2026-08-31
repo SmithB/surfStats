@@ -1,0 +1,15 @@
+# Core environment for the surfStats package itself
+# (surfStats/scale_map_fft2.py, relief_map.py, im_subset.py, scaleMap/*).
+# Python version intentionally left unpinned -- conda will resolve one
+# compatible with gdal/numpy/scipy.
+#
+# Create with: conda env create -f environment.yml
+name: surfStats
+channels:
+  - conda-forge
+dependencies:
+  - numpy
+  - scipy
+  - gdal
+  - pyfftw
+  - pytest

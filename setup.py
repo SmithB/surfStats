@@ -9,7 +9,7 @@ with open("README.md", "r") as fh:
 # list of all scripts to be included with package
 scripts = [os.path.join('scripts',f) for f in os.listdir('scripts') \
            if not (f[0]=='.' or f[-1]=='~' or os.path.isdir(os.path.join('scripts', f)))] +\
-              [os.path.join('surfStats', f) for f in ['scale_map_fft2.py']]
+              [os.path.join('surfStats', f) for f in ['scale_map_fft2.py', 'relief_map.py']]
 
 setup(
     name='surfStats',
@@ -30,6 +30,11 @@ setup(
         'Programming Language :: Python :: 3.9',
     ],
     keywords='spectral analysis, topothesy, TBTL',
-    packages=find_packages(),
+    packages=find_packages(exclude=['tests', 'tests.*']),
+    python_requires='>=3.9',
+    # GDAL is also a hard requirement (surfStats.im_subset, scale_map_fft2 and
+    # relief_map all import osgeo), but it is not reliably pip-installable --
+    # use environment.yml to build the conda environment.
+    install_requires=['numpy', 'scipy'],
     scripts=scripts
 )

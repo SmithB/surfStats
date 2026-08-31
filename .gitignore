@@ -135,3 +135,8 @@ dmypy.json
 # images and movies:
 *.mp4
 *.tif
+
+# editor backups and profiler output
+*~
+memray-*.bin
+memray-*.html
