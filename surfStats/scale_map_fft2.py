@@ -15,19 +15,19 @@ except ImportError:
    
 from multiprocessing import Pool, freeze_support
 import argparse
-#import scipy.fftpack as sfft
 import scipy.ndimage as snd
-#import scipy.interpolate as sint
 import numpy as np
-#import matplotlib.pyplot as plt
 from surfStats import im_subset
 import surfStats.scaleMap as sm
 
+# pyfftw is optional; get_power picks the backend, we only decide whether to
+# ask for it.  Note that the FFT entry points live in pyfftw.interfaces, not on
+# the pyfftw top level.
 try:
-   import pyfftw as fft
+   import pyfftw
+   import pyfftw.interfaces
 except ImportError:
-    import numpy.fft as fft
-#import numpy.fft as fft    
+    pyfftw = None
 import sys, os
 import time
 np.seterr(invalid='ignore')
@@ -36,6 +36,21 @@ def get_P_wrapper(argList):
     [ img, W, lambda_els, kx, ky, use_fftw, Wsum, Wsum2, use_mean, r_out, c_out]=argList
     P, az, R, bar, fft_time=sm.get_power(img, W, lambda_els, kx, ky, use_fftw=use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=use_mean)
     return (r_out, c_out, P, az, R, bar, fft_time)
+
+def pgc_companion_path(input_file, suffix):
+    # PGC companion products (matchtag/bitmask) are always plain GeoTIFFs,
+    # regardless of what format the main DEM is stored in (.tif, .vrt, ...).
+    base = os.path.splitext(input_file)[0]
+    if base.endswith('_dem'):
+        base = base[:-len('_dem')]
+    return f"{base}_{suffix}.tif"
+
+def _open_or_die(path, description):
+    ds = gdal.Open(path)
+    if ds is None:
+        raise SystemExit(f"could not open {description} '{path}' with GDAL "
+                          f"(check the path and that GDAL recognizes the format)")
+    return ds
 
 def mask_pgc( this_bounds, mask, pgc_subs, dec):
     for key, sub in pgc_subs.items():
@@ -48,14 +63,15 @@ def mask_pgc( this_bounds, mask, pgc_subs, dec):
                 snd.binary_erosion(np.squeeze(pgc_subs['matchtag'].z), np.ones((1, dec), dtype=bool), border_value=1),
                 np.ones((dec,1), dtype=bool), border_value=1)
     else:
-        mask &= pgc_subs['matchtag'].z
+        mask &= np.squeeze(pgc_subs['matchtag'].z).astype(bool)
 
 def main():
     fold=True
     parser = argparse.ArgumentParser(description='calculate scale map on the specified file.  Positional arguments give the input file and the maximum scale')
-    parser.add_argument('input_file')
+    parser.add_argument('input_file', help='input DEM raster (any GDAL-readable format, e.g. GeoTIFF or VRT)')
     parser.add_argument('N_LW')
     parser.add_argument('--erode_scale', '-e', type=float, default=None)
+    parser.add_argument('--landsat', action='store_true', default=False, help='apply Landsat DN-to-reflectance scaling (z*2e-5-0.1) before eroding')
     parser.add_argument('--take_slope', '-t', action='store_true', default=False)
     parser.add_argument('--take_log', '-L', action='store_true', default=False)
     parser.add_argument('--use_mean','-m', action='store_true');
@@ -69,28 +85,38 @@ def main():
     parser.add_argument('--avg_name', type=str, default='aux', help='name for the quantity derived from the average file')
     parser.add_argument('--isotropic', '-i', action='store_true');
     args=parser.parse_args()
-    
+
+    if args.isotropic and not args.take_slope:
+        parser.error("--isotropic requires --take_slope: the isotropic power "
+                     "combines the x and y slope components")
+    if args.mask_file is not None and not args.mask_values:
+        parser.error("--mask_file requires --mask_values: without it every "
+                     "pixel would be masked out")
+
     N_LW=int(args.N_LW)
     
+    # check if pyfftw is available, activate the plan cache if it is
+    use_fftw=False
+    if pyfftw is not None:
+        try:
+            pyfftw.interfaces.cache.enable()
+            use_fftw=True
+        except AttributeError:
+            use_fftw=False
+
     if args.num_processes>1:
         # setup the multiprocessing pool
         myPool=Pool(args.num_processes);
-    # check if pyfftw is enabled, activate the cache if it is
-    try:
-        fft.interfaces.cache.enable()
-        use_fftw=True
-    except:
-        use_fftw=False
     
     out_keys=['P','Ps','az','R']
 
-    ds=gdal.Open(args.input_file)
+    ds=_open_or_die(args.input_file, "input file")
     if args.avg_file is not None:
-        avg_ds=gdal.Open(args.avg_file)
+        avg_ds=_open_or_die(args.avg_file, "avg file")
         avg_sub=im_subset(0, 0, 0, 0, avg_ds, pad_val=0, Bands=[1])
 
     if args.mask_file is not None:
-        mask_ds=gdal.Open(args.mask_file)
+        mask_ds=_open_or_die(args.mask_file, "mask file")
         mask_sub=im_subset(0, 0, 0, 0, mask_ds, pad_val=0, Bands=[1])
     out_base=os.path.splitext(args.input_file)[0];
     
@@ -125,7 +151,7 @@ def main():
     print("NOTE:: using two times the largest scale for N")
     N=(scales[-1])*2.
 
-    az, L, kx, ky=sm.az_lambda(N, N, 1, fold=fold)
+    _, L, kx, ky=sm.az_lambda(N, N, 1, fold=fold)
     L_bins=[np.ravel_multi_index(np.nonzero((L>=this) & (L < 2*this)), L.shape) for this in scales]
     W=sm.hanning2(N)
     Wsum=np.sum(W.ravel())
@@ -160,25 +186,29 @@ def main():
         Dsets[args.avg_name] = driver.Create(out_files[args.avg_name], int(nX/dec), int(nY/dec), 1,\
                                    gdalconst.GDT_Float32, options = ['BigTIFF=YES'])
         subs[args.avg_name]=im_subset(0, 0, int( nX/dec), int(nY/dec), Dsets[args.avg_name], Bands=[1])
-        out_keys += [args.avg_name]
 
     
     if args.pgc_masks:
         pgc_subs={}
         for key, pad_val in zip(['matchtag','bitmask'], [1, 0]):
-            sub_ds=gdal.Open(args.input_file.replace('_dem.tif','_'+key+'.tif'))
+            companion_path = pgc_companion_path(args.input_file, key)
+            sub_ds=_open_or_die(companion_path, f"PGC {key} file")
             pgc_subs[key] = im_subset(0, 0, nX, nY, sub_ds, pad_val=pad_val, Bands=[1])
 
 
     total_fft_time=0.0
     start_time=time.time()
     for out_ds in Dsets.values():
-        for bandN in [bands[0]]:
-            band=out_ds.GetRasterBand(int(bandN))
+        for bandN in range(1, out_ds.RasterCount+1):
+            band=out_ds.GetRasterBand(bandN)
             band.SetNoDataValue(out_nodata)
+            # GTiff creates the band filled with zeros, which is indistinguishable
+            # from a real result.  Pre-fill with nodata so that blocks we skip
+            # read back as nodata instead of as zero.
+            band.Fill(out_nodata)
 
     if args.erode_scale is not None:
-        erode_kernel=np.ones([1, 2*args.erode_scale]).astype('bool')
+        erode_kernel=np.ones([1, int(2*args.erode_scale)], dtype=bool)
 
     start=time.time()
     dtime=0
@@ -201,7 +231,7 @@ def main():
 
         if args.mask_file is not None:
             mask_sub.setBounds(*in_bounds, update=True)
-            in_sub.z.ravel()[~np.in1d(mask_sub.z.ravel(), args.mask_values)]=inNoData
+            in_sub.z.ravel()[~np.isin(mask_sub.z[0].ravel(), args.mask_values)]=inNoData
         
         if args.pgc_masks:
             mask = np.ones_like(in_sub.z, dtype=bool)
@@ -209,23 +239,30 @@ def main():
             in_sub.z.ravel()[mask.ravel()==0] = inNoData
 
         if np.all(np.logical_or(in_sub.z == 0, np.logical_or(np.isnan(in_sub.z), in_sub.z==inNoData))):
-            for sub in subs.values():
-                sub.writeSubsetTo(None, sub)
+            # Nothing to compute.  Consecutive output blocks overlap, so writing
+            # this all-nodata buffer would erase the valid pixels the previous
+            # block put in the overlap.  The bands were pre-filled with nodata.
             continue
 
         if args.avg_file is not None:
-            avg_sub.setBounds(in_sub.c0, in_sub.r0, nX, nY, update=True)
+            avg_sub.setBounds(in_sub.c0, in_sub.r0, in_sub.Nc, in_sub.Nr, update=True)
             avg_sub_sub = im_subset(0, 0, blocksize, blocksize, avg_sub)
 
+        if args.landsat or args.erode_scale is not None:
+            # derive the nodata mask from the raw DNs, before any rescaling
+            nodata_mask=np.logical_or(in_sub.z == 0., np.logical_or(np.isnan(in_sub.z), in_sub.z==inNoData))
+
+        if args.landsat:
+            in_sub.z=np.maximum(0, in_sub.z*2.e-5-0.1)
+            in_sub.z[nodata_mask]=inNoData
+
         if args.erode_scale is not None:
-            mask=np.logical_or(in_sub.z == 0., np.logical_or(np.isnan(in_sub.z), in_sub.z==inNoData))
+            mask=nodata_mask
             if np.any(mask):
-                mask[0,:,:]=snd.morphology.binary_dilation(mask[0,:,:], structure=erode_kernel)
-                mask[0,:,:]=snd.morphology.binary_dilation(mask[0,:,:], structure=erode_kernel.transpose())
+                mask[0,:,:]=snd.binary_dilation(mask[0,:,:], structure=erode_kernel)
+                mask[0,:,:]=snd.binary_dilation(mask[0,:,:], structure=erode_kernel.transpose())
             if np.all(mask):
                 continue
-            if args.landsat:
-                in_sub.z=np.maximum(0, in_sub.z*2.e-5-0.1)
 
             in_sub.z[mask]=inNoData
             
@@ -236,7 +273,7 @@ def main():
                 mask=in_sub.z==inNoData    
             if args.prefilter_width is not None:
                 #print "prefiltering with kernel of width %f" % args.prefilter_width
-                in_sub.z[0,:,:]=snd.filters.gaussian_filter(in_sub.z[0,:,:], args.prefilter_width, mode='reflect');
+                in_sub.z[0,:,:]=snd.gaussian_filter(in_sub.z[0,:,:], args.prefilter_width, mode='reflect');
             gx, gy=np.gradient(in_sub.z[0,:,:])
             in_sub.z[0,:,:]=gx/dx;
             # anywhere the gradient of the mask is nonzero, set the mask to zero
@@ -255,7 +292,7 @@ def main():
            in_sub.z=np.log10(in_sub.z)
            
         parallelInputList=list();
-        for fft_sub in im_subset(in_sub.c0, in_sub.r0, blocksize, blocksize, in_sub, Bands=[[1]], stride=dec, pad=(N-dec)/2, no_edges=True):
+        for fft_sub in im_subset(in_sub.c0, in_sub.r0, blocksize, blocksize, in_sub, Bands=[1], stride=dec, pad=(N-dec)/2, no_edges=True):
             if fft_sub.z.dtype == 'int8':
                 fft_sub.z=fft_sub.z.view(np.uint8);
             if args.take_slope:
@@ -265,19 +302,20 @@ def main():
             if np.any(mask):
                 continue
 
+            zx=np.float64(fft_sub.z[0,:,:])
+            if np.sum(zx.ravel())==0:
+                continue
+
             if args.isotropic:
-                fft_sub_y=im_subset(fft_sub.c0, fft_sub.r0, blocksize, blocksize, gy_sub, Bands=[[1]], stride=dec, pad=(N-dec)/2, no_edges=True);
+                fft_sub_y=im_subset(fft_sub.c0, fft_sub.r0, blocksize, blocksize, gy_sub, Bands=[1], stride=dec, pad=(N-dec)/2, no_edges=True);
                 fft_sub_y.setBounds(fft_sub.c0, fft_sub.r0, fft_sub.Nc, fft_sub.Nr, update=True)
-                imageData=np.zeros([2, fft_sub.Nc, fft_sub.Nr])
-                imageData[0,:,:]=np.float64(fft_sub.z[0,:,:])
+                imageData=np.zeros([2, fft_sub.Nr, fft_sub.Nc])
+                imageData[0,:,:]=zx
                 imageData[1,:,:]=np.float64(fft_sub_y.z[0,:,:])
             else:
-                imageData=np.float64(fft_sub.z[0,:,:])
+                imageData=zx
             r_out=int((fft_sub.r0+N/2)/dec)-subs['P'].r0
             c_out=int((fft_sub.c0+N/2)/dec)-subs['P'].c0
-            dd=np.float64(fft_sub.z[0,:,:])
-            if np.sum(dd.ravel)==0:
-                continue
 
             if args.avg_file is not None:
                 avg_sub_sub.setBounds(fft_sub.c0, fft_sub.r0, fft_sub.Nc, fft_sub.Nr, update=True)
@@ -294,34 +332,22 @@ def main():
                     subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
                  total_fft_time=total_fft_time+fft_time_i
             else:
-                #P_i, az_i, R_i, bar_i=get_P(W, imageData, L_bins, kx.ravel(), ky.ravel(), use_fftw, Wsum=Wsum, Wsum2=Wsum2, use_mean=args.use_mean)
                 parallelInputList.append( (imageData, W, L_bins, kx.ravel(), ky.ravel(), use_fftw, Wsum, Wsum2, args.use_mean, r_out, c_out))
         if args.num_processes>1:
             # now run the jobs in parallel, get their output (in random order)
-            parallelOutputList=myPool.map(get_P_wrapper, parallelInputList)                              
-            #parallelOutputList=[get_P_wrapper(thing) for thing in parallelInputList]
+            parallelOutputList=myPool.map(get_P_wrapper, parallelInputList)
             for parallelItem in parallelOutputList:
                 r_out, c_out, P_i, az_i, R_i, bar_i, fft_time_i = parallelItem
                 subs['P'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)
                 subs['az'].z[:,r_out, c_out]=az_i.ravel()
                 subs['R'].z[:, r_out, c_out]=np.log10(R_i.ravel())
                 if bar_i == 0:
-                    subs['Ps'].z[:, r_out, c_out]= np.nan + np.ones_like(P_i.ravel());
+                    subs['Ps'].z[:, r_out, c_out]=np.nan
                 else:
-                    try:
-                       subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
-                    except Exception as e:
-                       print((r_out, c_out))
-                       print(P_i.shape)
-                       print(bar_i.shape)
-                       print(subs['Ps'].xy0.shape)
-                       print(subs['Ps'].pad)
-                       print((hasattr(subs['Ps'], 'xy0'), hasattr(subs['P'],'xy0')))
-                       subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
-                       raise(e)
+                    subs['Ps'].z[:, r_out, c_out]=np.log10( P_i.ravel()/N**4.)-np.log10(np.abs(bar_i)**2)
                 total_fft_time=total_fft_time+fft_time_i
         subs['az'].z[subs['az'].z<0]+=180. 
-        subs['az'].z[subs['P'].z==out_nodata]=out_nodata
+        subs['az'].z[np.isnan(subs['P'].z)]=out_nodata
         for key, sub in subs.items():
             sub.writeSubsetTo(sub.Bands, sub)#, VERBOSE=key=='P')
 
@@ -346,6 +372,10 @@ def main():
     del(subs)
     import gc
     gc.collect()
+
+    if args.num_processes>1:
+        myPool.close()
+        myPool.join()
         
 if __name__=="__main__":
     freeze_support()

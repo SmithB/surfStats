@@ -19,6 +19,7 @@ import argparse
 import scipy.ndimage as snd
 import numpy as np
 from surfStats import im_subset
+from surfStats.scale_map_fft2 import pgc_companion_path, _open_or_die
 import scipy.stats as sps
 
 import sys, os
@@ -36,7 +37,7 @@ def mask_pgc( this_bounds, mask, pgc_subs, dec):
                 snd.binary_erosion(np.squeeze(pgc_subs['matchtag'].z), np.ones((1, dec), dtype=bool), border_value=1),
                 np.ones((dec,1), dtype=bool), border_value=1)
     else:
-        mask &= pgc_subs['matchtag'].z
+        mask &= np.squeeze(pgc_subs['matchtag'].z).astype(bool)
 
 def main():
     parser = argparse.ArgumentParser(description='calculate scale map on the specified file.  Positional arguments give the input file and the maximum scale')
@@ -50,15 +51,18 @@ def main():
     parser.add_argument('--out_label', type=str, help='add this string to the output file name')
     args=parser.parse_args()
 
+    if args.mask_file is not None and not args.mask_values:
+        parser.error("--mask_file requires --mask_values: without it every "
+                     "pixel would be masked out")
 
     out_keys=['zmin','zmax', 'zmed','sigma']
 
     pct=[args.percent, 16., 50, 84, 100-args.percent]
 
-    ds=gdal.Open(args.input_file)
+    ds=_open_or_die(args.input_file, "input file")
 
     if args.mask_file is not None:
-        mask_ds=gdal.Open(args.mask_file)
+        mask_ds=_open_or_die(args.mask_file, "mask file")
         mask_sub=im_subset(0, 0, 0, 0, mask_ds, pad_val=0, Bands=[1])
     out_base=os.path.splitext(args.input_file)[0];
 
@@ -69,7 +73,7 @@ def main():
     for key in out_keys:
         out_files[key]=out_base+f'_{key}_relief.tif'
 
-    out_nodata=np.NaN
+    out_nodata=np.nan
 
     print("working on %s, outfile is %s" % (args.input_file, out_files['zmed']) )
 
@@ -103,16 +107,21 @@ def main():
     if args.pgc_masks:
         pgc_subs={}
         for key, pad_val in zip(['matchtag','bitmask'], [1, 0]):
-            sub_ds=gdal.Open(args.input_file.replace('_dem.tif','_'+key+'.tif'))
+            companion_path = pgc_companion_path(args.input_file, key)
+            sub_ds=_open_or_die(companion_path, f"PGC {key} file")
             pgc_subs[key] = im_subset(0, 0, nX, nY, sub_ds, pad_val=pad_val, Bands=[1])
 
     start_time=time.time()
     for out_ds in Dsets.values():
         band=out_ds.GetRasterBand(1)
         band.SetNoDataValue(out_nodata)
+        # GTiff creates the band filled with zeros, which is indistinguishable
+        # from a real result.  Pre-fill with nodata so that blocks we skip read
+        # back as nodata instead of as zero.
+        band.Fill(out_nodata)
 
     if args.erode_scale is not None:
-        erode_kernel=np.ones([1, 2*args.erode_scale]).astype('bool')
+        erode_kernel=np.ones([1, int(2*args.erode_scale)], dtype=bool)
 
     start=time.time()
     dtime=0
@@ -135,51 +144,43 @@ def main():
 
         if args.mask_file is not None:
             mask_sub.setBounds(*in_bounds, update=True)
-            in_sub.z.ravel()[~np.in1d(mask_sub.z.ravel(), args.mask_values)]=inNoData
+            in_sub.z.ravel()[~np.isin(mask_sub.z[0].ravel(), args.mask_values)]=inNoData
 
         if args.pgc_masks:
             mask = np.ones_like(in_sub.z, dtype=bool)
             mask_pgc(in_bounds, mask, pgc_subs, int(dec))
-            #if np.any(mask.ravel()==0) and not np.all((in_sub.z==inNoData) | (in_sub.z==0)):
-            #    print('mask!')
             in_sub.z.ravel()[mask.ravel()==0] = inNoData
 
         if np.all(np.logical_or(in_sub.z == 0, np.logical_or(np.isnan(in_sub.z), in_sub.z==inNoData))):
-            for sub in subs.values():
-                sub.writeSubsetTo(None, sub)
+            # Nothing to compute.  Consecutive output blocks overlap, so writing
+            # this all-nodata buffer would erase the valid pixels the previous
+            # block put in the overlap.  The bands were pre-filled with nodata.
             continue
 
         if args.erode_scale is not None:
             mask=np.logical_or(in_sub.z == 0., np.logical_or(np.isnan(in_sub.z), in_sub.z==inNoData))
             if np.any(mask):
-                mask[0,:,:]=snd.morphology.binary_dilation(mask[0,:,:], structure=erode_kernel)
-                mask[0,:,:]=snd.morphology.binary_dilation(mask[0,:,:], structure=erode_kernel.transpose())
+                mask[0,:,:]=snd.binary_dilation(mask[0,:,:], structure=erode_kernel)
+                mask[0,:,:]=snd.binary_dilation(mask[0,:,:], structure=erode_kernel.transpose())
             if np.all(mask):
                 continue
-            if args.landsat:
-                in_sub.z=np.maximum(0, in_sub.z*2.e-5-0.1)
 
             in_sub.z[mask]=inNoData
 
-        for this_sub in im_subset(in_sub.c0, in_sub.r0, blocksize, blocksize, in_sub, Bands=[[1]], stride=dec, pad=(N-dec)/2, no_edges=True):
+        for this_sub in im_subset(in_sub.c0, in_sub.r0, blocksize, blocksize, in_sub, Bands=[1], stride=dec, pad=(N-dec)/2, no_edges=True):
 
             mask=np.logical_or(np.isnan(this_sub.z), this_sub.z==inNoData)
             if np.any(mask):
                 continue
 
             imageData=np.float64(this_sub.z[0,:,:])
+            if np.sum(imageData.ravel())==0:
+                continue
             r_out=int((this_sub.r0+N/2)/dec) - subs['zmed'].r0
             c_out=int((this_sub.c0+N/2)/dec) - subs['zmed'].c0
-            dd = np.float64(this_sub.z[0,:,:])
-            if np.sum(dd.ravel())==0:
-                continue
 
             hmin, hm0, hmed, hm1, hmax = sps.scoreatpercentile(imageData.ravel(), pct)
-            try:
-                subs['zmin'].z[0, r_out, c_out]=hmed - hmin
-            except Exception as e:
-                print(e)
-                pass
+            subs['zmin'].z[0, r_out, c_out]=hmed - hmin
             subs['zmax'].z[0, r_out, c_out] = hmax - hmed
             subs['zmed'].z[0, r_out, c_out] = hmed
             subs['sigma'].z[0, r_out, c_out]=hm1-hm0
